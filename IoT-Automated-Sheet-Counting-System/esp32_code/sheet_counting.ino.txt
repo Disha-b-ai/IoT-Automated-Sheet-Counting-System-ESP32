@@ -1,0 +1,213 @@
+#include <FirebaseESP32.h>
+#include <WiFi.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// ================= WIFI & FIREBASE CONFIG =================
+#define WIFI_SSID "YOUR_WIFI_NAME"
+#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+
+#define FIREBASE_HOST "YOUR_FIREBASE_DATABASE_URL"
+#define FIREBASE_AUTH "YOUR_FIREBASE_API_KEY"
+
+// ================= PIN DEFINITIONS =================
+#define TRIG_PIN 5
+#define ECHO_PIN 18
+#define LED_PIN 2
+
+// ================= SYSTEM PARAMETERS =================
+const int AVERAGE_READS = 3;
+const unsigned long CHECK_INTERVAL = 20;
+const unsigned long MAX_SHEET_DURATION = 2000;
+const unsigned long COOLDOWN_PERIOD = 3000;
+const unsigned long JAM_CLEAR_DELAY = 10000;
+const unsigned long LED_BLINK_DURATION = 5000;
+const unsigned long LED_BLINK_INTERVAL = 250;
+const unsigned long MAX_DURATION = 120000;
+
+const float DETECTION_THRESHOLD_CM = 2.0;
+
+// ================= GLOBAL VARIABLES =================
+int sheetCount = 0;
+bool sheetInRange = false;
+bool jammed = false;
+bool jammedSheetCounted = false;
+bool ledBlinking = false;
+bool ledState = false;
+
+unsigned long jamClearedTime = 0;
+unsigned long lastCheckTime = 0;
+unsigned long sheetDetectedTime = 0;
+unsigned long lastCountTime = 0;
+unsigned long ledBlinkStart = 0;
+unsigned long lastBlinkToggle = 0;
+unsigned long startTime;
+
+float backgroundDistance = 0;
+
+// ================= OBJECTS =================
+FirebaseConfig config;
+FirebaseAuth auth;
+FirebaseData firebaseData;
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// =====================================================
+// ======================= SETUP ========================
+// =====================================================
+void setup() {
+
+  Serial.begin(115200);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  // Connect WiFi
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+  }
+
+  // Firebase Setup
+  config.host = FIREBASE_HOST;
+  config.signer.tokens.legacy_token = FIREBASE_AUTH;
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  startTime = millis();
+  backgroundDistance = getAverageDistance(AVERAGE_READS);
+
+  // LCD Setup
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Sheets:");
+  lcd.setCursor(0, 1);
+  lcd.print(sheetCount);
+}
+
+// =====================================================
+// ======================== LOOP =======================
+// =====================================================
+void loop() {
+
+  unsigned long currentMillis = millis();
+
+  // Final upload after max duration
+  if (currentMillis - startTime > MAX_DURATION) {
+    Firebase.setInt(firebaseData, "/final_a4_sheet_count", sheetCount);
+    while (true);
+  }
+
+  handleLEDBlink(currentMillis);
+  checkSheetDetection(currentMillis);
+}
+
+// =====================================================
+// ==================== FUNCTIONS ======================
+// =====================================================
+
+void handleLEDBlink(unsigned long currentMillis) {
+  if (!ledBlinking) return;
+
+  if (currentMillis - ledBlinkStart >= LED_BLINK_DURATION) {
+    ledBlinking = false;
+    digitalWrite(LED_PIN, LOW);
+  }
+  else if (currentMillis - lastBlinkToggle >= LED_BLINK_INTERVAL) {
+    ledState = !ledState;
+    digitalWrite(LED_PIN, ledState);
+    lastBlinkToggle = currentMillis;
+  }
+}
+
+void checkSheetDetection(unsigned long currentMillis) {
+
+  if (currentMillis - lastCheckTime < CHECK_INTERVAL) return;
+  lastCheckTime = currentMillis;
+
+  float avgDistance = getAverageDistance(AVERAGE_READS);
+  bool sheetDetectedNow = (backgroundDistance - avgDistance > DETECTION_THRESHOLD_CM);
+
+  // Jam cleared logic
+  if (jammed && !sheetDetectedNow) {
+    if (jamClearedTime == 0) jamClearedTime = currentMillis;
+    if (currentMillis - jamClearedTime >= JAM_CLEAR_DELAY) {
+      jammed = false;
+      jammedSheetCounted = false;
+      jamClearedTime = 0;
+    }
+  }
+  else if (jammed && sheetDetectedNow) {
+    jamClearedTime = 0;
+    return;
+  }
+
+  if ((currentMillis - lastCountTime < COOLDOWN_PERIOD) || jammed)
+    return;
+
+  // Normal detection
+  if (sheetDetectedNow) {
+    if (!sheetInRange) {
+      sheetInRange = true;
+      sheetDetectedTime = currentMillis;
+      lastCountTime = currentMillis;
+      sheetCount++;
+      updateDisplayAndCloud();
+    }
+  }
+  else {
+    sheetInRange = false;
+  }
+
+  // Jam detection
+  if (sheetInRange && (currentMillis - sheetDetectedTime > MAX_SHEET_DURATION)) {
+    if (!jammed) {
+      jammed = true;
+      if (!jammedSheetCounted) {
+        sheetCount++;
+        jammedSheetCounted = true;
+        lastCountTime = currentMillis;
+        updateDisplayAndCloud();
+
+        ledBlinking = true;
+        ledBlinkStart = currentMillis;
+        lastBlinkToggle = currentMillis;
+        ledState = true;
+        digitalWrite(LED_PIN, HIGH);
+      }
+    }
+  }
+}
+
+void updateDisplayAndCloud() {
+  Firebase.setInt(firebaseData, "/a4_sheet_count", sheetCount);
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Sheets:");
+  lcd.setCursor(0, 1);
+  lcd.print(sheetCount);
+}
+
+float getAverageDistance(int samples) {
+  long total = 0;
+  for (int i = 0; i < samples; i++) {
+    total += measureDistance();
+    delay(5);
+  }
+  return total / float(samples);
+}
+
+long measureDistance() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+  return duration * 0.034 / 2;
+}
